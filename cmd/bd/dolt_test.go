@@ -1546,6 +1546,183 @@ func TestRunExternalDoltStatus_Unreachable(t *testing.T) {
 	})
 }
 
+func TestShouldProbeLocalDoltStatusAfterPidMiss(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   *configfile.Config
+		state *doltserver.State
+		want  bool
+	}{
+		{
+			name:  "nil config does not probe",
+			cfg:   nil,
+			state: &doltserver.State{Running: false},
+			want:  false,
+		},
+		{
+			name: "nil state does not probe",
+			cfg: &configfile.Config{
+				Backend:        "dolt",
+				DoltMode:       "server",
+				DoltServerHost: "127.0.0.1",
+			},
+			state: nil,
+			want:  false,
+		},
+		{
+			name: "managed PID state remains authoritative",
+			cfg: &configfile.Config{
+				Backend:        "dolt",
+				DoltMode:       "server",
+				DoltServerHost: "127.0.0.1",
+			},
+			state: &doltserver.State{Running: true, PID: 1234, Port: 3307},
+			want:  false,
+		},
+		{
+			name: "embedded mode does not probe",
+			cfg: &configfile.Config{
+				Backend:  "dolt",
+				DoltMode: "embedded",
+			},
+			state: &doltserver.State{Running: false},
+			want:  false,
+		},
+		{
+			name: "remote server mode remains external predicate responsibility",
+			cfg: &configfile.Config{
+				Backend:        "dolt",
+				DoltMode:       "server",
+				DoltServerHost: "dolt.example.com",
+			},
+			state: &doltserver.State{Running: false},
+			want:  false,
+		},
+		{
+			name: "local server mode probes configured endpoint after PID miss",
+			cfg: &configfile.Config{
+				Backend:        "dolt",
+				DoltMode:       "server",
+				DoltServerHost: "127.0.0.1",
+			},
+			state: &doltserver.State{Running: false},
+			want:  true,
+		},
+		{
+			name: "empty host defaults to local endpoint after PID miss",
+			cfg: &configfile.Config{
+				Backend:  "dolt",
+				DoltMode: "server",
+			},
+			state: &doltserver.State{Running: false},
+			want:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldProbeLocalDoltStatusAfterPidMiss(tc.cfg, tc.state); got != tc.want {
+				t.Errorf("shouldProbeLocalDoltStatusAfterPidMiss = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunExternalDoltStatusWithProbe_SuccessNoPidFiles(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "3307")
+
+	beadsDir := t.TempDir()
+	cfg := &configfile.Config{
+		Backend:        "dolt",
+		DoltMode:       "server",
+		DoltServerHost: "127.0.0.1",
+		DoltServerUser: "root",
+		DoltDatabase:   "beads",
+	}
+
+	orig := jsonOutput
+	defer func() { jsonOutput = orig }()
+	jsonOutput = true
+
+	out := captureStdout(t, func() error {
+		runExternalDoltStatusWithProbe(beadsDir, cfg, func(ctx context.Context, dsn string) (bool, string, error) {
+			if !strings.Contains(dsn, "127.0.0.1") || !strings.Contains(dsn, "3307") {
+				t.Fatalf("DSN did not target configured local endpoint: %s", dsn)
+			}
+			return true, "8.0.33-Dolt", nil
+		})
+		return nil
+	})
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("expected valid JSON output, got error %v, raw: %s", err, out)
+	}
+	if result["mode"] != "external" {
+		t.Errorf("mode = %v, want external", result["mode"])
+	}
+	if result["running"] != true {
+		t.Errorf("running = %v, want true", result["running"])
+	}
+	if result["host"] != "127.0.0.1" {
+		t.Errorf("host = %v, want 127.0.0.1", result["host"])
+	}
+	if got, _ := result["port"].(float64); int(got) != 3307 {
+		t.Errorf("port = %v, want 3307", result["port"])
+	}
+	if result["version"] != "8.0.33-Dolt" {
+		t.Errorf("version = %v, want 8.0.33-Dolt", result["version"])
+	}
+	assertNoDoltLedgerFiles(t, beadsDir)
+}
+
+func TestRunExternalDoltStatusWithProbe_UnreachableNoPidFiles(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "3307")
+
+	beadsDir := t.TempDir()
+	cfg := &configfile.Config{
+		Backend:        "dolt",
+		DoltMode:       "server",
+		DoltServerHost: "127.0.0.1",
+		DoltServerUser: "root",
+		DoltDatabase:   "beads",
+	}
+
+	orig := jsonOutput
+	defer func() { jsonOutput = orig }()
+	jsonOutput = true
+
+	out := captureStdout(t, func() error {
+		runExternalDoltStatusWithProbe(beadsDir, cfg, func(ctx context.Context, dsn string) (bool, string, error) {
+			return false, "", errors.New("connection refused")
+		})
+		return nil
+	})
+
+	var result map[string]any
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("expected valid JSON output, got error %v, raw: %s", err, out)
+	}
+	if result["running"] != false {
+		t.Errorf("running = %v, want false", result["running"])
+	}
+	if result["error"] != "connection refused" {
+		t.Errorf("error = %v, want connection refused", result["error"])
+	}
+	assertNoDoltLedgerFiles(t, beadsDir)
+}
+
+func assertNoDoltLedgerFiles(t *testing.T, beadsDir string) {
+	t.Helper()
+	for _, name := range []string{"dolt-server.pid", "dolt-server.port", "dolt-server.lock"} {
+		if _, err := os.Stat(filepath.Join(beadsDir, name)); err == nil {
+			t.Fatalf("%s was created unexpectedly", name)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("checking %s: %v", name, err)
+		}
+	}
+}
+
 // TestShouldUseExternalDoltStatus covers the routing predicate for
 // `bd dolt status`. The predicate decides whether to ping the configured
 // SQL endpoint (externally-managed server) or read the local PID file

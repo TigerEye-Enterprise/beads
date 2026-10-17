@@ -1647,7 +1647,7 @@ func TestRunExternalDoltStatusWithProbe_SuccessNoPidFiles(t *testing.T) {
 	out := captureStdout(t, func() error {
 		runExternalDoltStatusWithProbe(beadsDir, cfg, func(ctx context.Context, dsn string) (bool, string, error) {
 			if !strings.Contains(dsn, "127.0.0.1") || !strings.Contains(dsn, "3307") {
-				t.Fatalf("DSN did not target configured local endpoint: %s", dsn)
+				t.Fatal("DSN did not target configured local endpoint")
 			}
 			return true, "8.0.33-Dolt", nil
 		})

@@ -256,6 +256,15 @@ func runsPostCommandMaintenance(cmdName string, strictReadonly bool) bool {
 	return effectiveRootStorePolicy(cmdName, strictReadonly).runMaintenance
 }
 
+func runsPostCommandMaintenanceForCommand(cmd *cobra.Command, strictReadonly bool) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		if c == doltSnapshotCmd {
+			return false
+		}
+	}
+	return runsPostCommandMaintenance(cmd.Name(), strictReadonly)
+}
+
 // resolveDoltServerConnection fills in how to reach the workspace's Dolt SQL
 // server — host, port, socket, user, password, TLS — on doltCfg.
 //
@@ -1924,7 +1933,7 @@ var rootCmd = &cobra.Command{
 			// of them. Guarding the outer block keeps that promise in one
 			// place instead of six. Writes never get here at all: they were
 			// refused in PersistentPreRunE.
-			if runsPostCommandMaintenance(cmd.Name(), readonlyMode) && !commandFreeze.Frozen() {
+			if runsPostCommandMaintenanceForCommand(cmd, readonlyMode) && !commandFreeze.Frozen() {
 				// Dolt auto-commit: after a successful write command (and after final flush),
 				// create a Dolt commit so changes don't remain only in the working set.
 				if commandDidWrite.Load() && !commandDidExplicitDoltCommit {

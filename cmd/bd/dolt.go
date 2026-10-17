@@ -1118,6 +1118,10 @@ endpoint via SQL and reports reachability, server version, and database.`,
 		if err != nil {
 			return HandleError("%v", err)
 		}
+		if shouldProbeLocalDoltStatusAfterPidMiss(cfg, state) {
+			runExternalDoltStatus(beadsDir, cfg)
+			return nil
+		}
 		renderLocalDoltStatus(state, serverDir)
 		return nil
 	},
@@ -1209,6 +1213,22 @@ func shouldUseExternalDoltStatus(cfg *configfile.Config, autoStartDisabled, shar
 	return autoStartDisabled
 }
 
+// shouldProbeLocalDoltStatusAfterPidMiss reports whether a local
+// server-mode workspace should fall back to a SQL reachability probe after
+// the managed PID-file ledger says no bd-owned server is running. This keeps
+// lifecycle ownership distinct from liveness: a reachable configured local
+// endpoint is reported as reachable, but bd does not fabricate PID/lock files
+// or claim ownership of that process.
+func shouldProbeLocalDoltStatusAfterPidMiss(cfg *configfile.Config, state *doltserver.State) bool {
+	if cfg == nil || state == nil || state.Running {
+		return false
+	}
+	if !cfg.IsDoltServerMode() {
+		return false
+	}
+	return isLocalHost(cfg.GetDoltServerHost())
+}
+
 // isLocalHost reports whether host refers to this machine. Used to
 // distinguish beads-managed local servers from externally-hosted ones.
 func isLocalHost(host string) bool {
@@ -1223,11 +1243,17 @@ func isLocalHost(host string) bool {
 	return false
 }
 
+type doltStatusProbe func(ctx context.Context, dsn string) (running bool, version string, connErr error)
+
 // runExternalDoltStatus queries an externally-hosted Dolt server and prints
 // (or returns, for --json) status. Unlike the local path, there is no PID or
 // log file — reachability, version, host/port/database, and TLS mode are the
 // user-relevant signals.
 func runExternalDoltStatus(beadsDir string, cfg *configfile.Config) {
+	runExternalDoltStatusWithProbe(beadsDir, cfg, probeExternalDoltStatus)
+}
+
+func runExternalDoltStatusWithProbe(beadsDir string, cfg *configfile.Config, probe doltStatusProbe) {
 	host := cfg.GetDoltServerHost()
 	port := doltserver.DefaultConfig(beadsDir).Port
 	user := cfg.GetDoltServerUser()
@@ -1253,25 +1279,9 @@ func runExternalDoltStatus(beadsDir string, cfg *configfile.Config) {
 		"tls":      tls,
 	}
 
-	db, openErr := sql.Open("mysql", dsn)
-	var running bool
-	var version string
-	var connErr error
-
-	if openErr == nil {
-		defer db.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if pingErr := db.PingContext(ctx); pingErr != nil {
-			connErr = pingErr
-		} else {
-			running = true
-			// Best-effort version lookup; don't treat errors as fatal.
-			_ = db.QueryRowContext(ctx, "SELECT @@version").Scan(&version)
-		}
-	} else {
-		connErr = openErr
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	running, version, connErr := probe(ctx, dsn)
 
 	result["running"] = running
 	if version != "" {
@@ -1304,6 +1314,23 @@ func runExternalDoltStatus(beadsDir string, cfg *configfile.Config) {
 	if connErr != nil {
 		fmt.Printf("  Error:    %v\n", connErr)
 	}
+}
+
+func probeExternalDoltStatus(ctx context.Context, dsn string) (bool, string, error) {
+	db, openErr := sql.Open("mysql", dsn)
+	if openErr != nil {
+		return false, "", openErr
+	}
+	defer db.Close()
+
+	if pingErr := db.PingContext(ctx); pingErr != nil {
+		return false, "", pingErr
+	}
+
+	var version string
+	// Best-effort version lookup; don't treat errors as fatal.
+	_ = db.QueryRowContext(ctx, "SELECT @@version").Scan(&version)
+	return true, version, nil
 }
 
 // showEmbeddedDoltStatus reports Dolt engine status when running in
